@@ -2,131 +2,180 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <signal.h>     // <== pentru sigaction, SA_RESTART etc.
-#include <dirent.h>     // <== pentru struct dirent și DT_DIR
-#include <sys/types.h>
-#include <sys/stat.h>
+#include <signal.h>
 #include <fcntl.h>
-#include <sys/wait.h>   // <== pentru waitpid și struct rusage dacă e folosit
+#include <dirent.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
+int pipefd[2];
+pid_t manager_pid = -1;
+int monitor_active = 0;
 
-pid_t monitor_pid = -1;
-int monitor_running = 0;
-int monitor_exiting = 0;
-
-// Handler pentru terminarea monitorului
-void sigchld_handler(int sig) {
+void child_exit_handler(int sig)
+{
     int status;
-    pid_t pid = waitpid(monitor_pid, &status, WNOHANG);
-    if (pid > 0) {
-        printf("Monitor process terminated with status %d\n", WEXITSTATUS(status));
-        monitor_running = 0;
-        monitor_exiting = 0;
-        monitor_pid = -1;
+    if (waitpid(manager_pid, &status, WNOHANG) > 0)
+    {
+        printf("Monitor exited (code %d)\n", WEXITSTATUS(status));
+        monitor_active = 0;
     }
 }
 
-// Scrie comanda în fișierul partajat și trimite semnal
-void send_command_to_monitor(const char *command) {
+void transmit_command(const char *cmd)
+{
     FILE *f = fopen("monitor_command.cmd", "w");
-    if (f == NULL) {
-        perror("Failed to write command file");
+    if (!f)
+    {
+        perror("Cannot write command");
         return;
     }
-
-    fprintf(f, "%s\n", command);
+    fprintf(f, "%s\n", cmd);
     fclose(f);
 
-    kill(monitor_pid, SIGUSR1);
+    kill(manager_pid, SIGUSR1);
+    usleep(200000);
+    char buff[1024];
+    ssize_t len = read(pipefd[0], buff, sizeof(buff) - 1);
+    if (len > 0)
+    {
+        buff[len] = '\0';
+        printf("%s", buff);
+    }
 }
 
-int main() {
+int main()
+{
     struct sigaction sa;
-    sa.sa_handler = sigchld_handler;
+    sa.sa_handler = child_exit_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
     sigaction(SIGCHLD, &sa, NULL);
 
-    char input[100];
+    char input[128];
 
-    while (1) {
-        printf("hub> ");
+    while (1)
+    {
+        printf("hub_> ");
         fflush(stdout);
 
-        if (fgets(input, sizeof(input), stdin) == NULL) {
-            printf("\n");
+        if (!fgets(input, sizeof(input), stdin))
             break;
-        }
+        input[strcspn(input, "\n")] = '\0';
 
-        input[strcspn(input, "\n")] = 0;
-
-        if (strcmp(input, "start_monitor") == 0) {
-            if (monitor_running) {
-                printf("Monitor already running with PID %d\n", monitor_pid);
+        if (strcmp(input, "start_monitor") == 0)
+        {
+            if (monitor_active)
+            {
+                printf("Monitor already running (PID %d)\n", manager_pid);
                 continue;
             }
 
-            monitor_pid = fork();
-            if (monitor_pid == 0) {
-                execl("./treasure_manager", "./treasure_manager", NULL);
-                perror("Failed to start monitor");
+            if (pipe(pipefd) == -1)
+            {
+                perror("pipe");
+                continue;
+            }
+
+            manager_pid = fork();
+            if (manager_pid == 0)
+            {
+                dup2(pipefd[1], STDOUT_FILENO);
+                close(pipefd[0]);
+                execl("./treasure_manager", "treasure_manager", NULL);
+                perror("exec");
                 exit(1);
-            } else if (monitor_pid > 0) {
-                monitor_running = 1;
-                printf("Monitor started with PID %d\n", monitor_pid);
-            } else {
-                perror("Fork failed");
+            }
+            else
+            {
+                close(pipefd[1]);
+                monitor_active = 1;
+                printf("Monitor started (PID %d)\n", manager_pid);
+            }
+        }
+        else if (strcmp(input, "stop_monitor") == 0)
+        {
+            if (!monitor_active)
+            {
+                printf("No monitor to stop.\n");
+                continue;
+            }
+            transmit_command("stop");
+        }
+        else if (strncmp(input, "list_", 5) == 0 || strncmp(input, "view_", 5) == 0)
+        {
+            if (!monitor_active)
+            {
+                printf("Start the monitor first.\n");
+                continue;
+            }
+            transmit_command(input);
+        }
+        else if (strcmp(input, "calculate_score") == 0)
+        {
+            DIR *d = opendir(".");
+            if (!d)
+            {
+                perror("opendir");
+                continue;
             }
 
-        } else if (strcmp(input, "list_hunts") == 0) {
-            if (!monitor_running) {
-                printf("Monitor is not running.\n");
-                continue;
-            }
-            if (monitor_exiting) {
-                printf("Monitor is shutting down. Please wait...\n");
-                continue;
-            }
-            send_command_to_monitor("list_hunts");
+            struct dirent *entry;
+            while ((entry = readdir(d)) != NULL)
+            {
+                if (entry->d_type == DT_DIR &&
+                    entry->d_name[0] != '.' &&
+                    strcmp(entry->d_name, "vscode") != 0)
+                {
 
-        } else if (strncmp(input, "list_treasures", 14) == 0) {
-            if (!monitor_running) {
-                printf("Monitor is not running.\n");
-                continue;
-            }
-            if (monitor_exiting) {
-                printf("Monitor is shutting down. Please wait...\n");
-                continue;
-            }
-            send_command_to_monitor(input);  // ex: list_treasures Hunt42
+                    int p[2];
+                    if (pipe(p) == -1)
+                    {
+                        perror("pipe");
+                        continue;
+                    }
 
-        } else if (strncmp(input, "view_treasure", 13) == 0) {
-            if (!monitor_running) {
-                printf("Monitor is not running.\n");
-                continue;
+                    pid_t scorer = fork();
+                    if (scorer == 0)
+                    {
+                        close(p[0]);
+                        dup2(p[1], STDOUT_FILENO);
+                        execl("./score_calculator", "score_calculator", entry->d_name, NULL);
+                        perror("exec score_calculator");
+                        exit(1);
+                    }
+                    else
+                    {
+                        close(p[1]);
+                        char line[256];
+                        ssize_t n;
+                        printf("Scores for %s:\n", entry->d_name);
+                        while ((n = read(p[0], line, sizeof(line) - 1)) > 0)
+                        {
+                            line[n] = '\0';
+                            printf("%s", line);
+                        }
+                        close(p[0]);
+                        waitpid(scorer, NULL, 0);
+                    }
+                }
             }
-            if (monitor_exiting) {
-                printf("Monitor is shutting down. Please wait...\n");
-                continue;
-            }
-            send_command_to_monitor(input);  // ex: view_treasure Hunt42 007
 
-        } else if (strcmp(input, "stop_monitor") == 0) {
-            if (!monitor_running) {
-                printf("Monitor is not running.\n");
-                continue;
+            closedir(d);
+        }
+        else if (strcmp(input, "exit") == 0)
+        {
+            if (monitor_active)
+            {
+                printf("Stop monitor first before exiting.\n");
             }
-            send_command_to_monitor("stop");
-            monitor_exiting = 1;
-
-        } else if (strcmp(input, "exit") == 0) {
-            if (monitor_running) {
-                printf("Error: Cannot exit while monitor is running. Use stop_monitor first.\n");
-                continue;
+            else
+            {
+                break;
             }
-            break;
-
-        } else {
+        }
+        else
+        {
             printf("Unknown command: %s\n", input);
         }
     }

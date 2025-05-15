@@ -1,147 +1,176 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <signal.h>
 #include <unistd.h>
-#include <signal.h>     // <== pentru sigaction, SA_RESTART etc.
-#include <dirent.h>     // <== pentru struct dirent și DT_DIR
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <sys/wait.h>   // <== pentru waitpid și struct rusage dacă e folosit
 
+volatile sig_atomic_t received_signal = 0;
 
-volatile sig_atomic_t got_command = 0;
-
-void sigusr1_handler(int sig) {
-    got_command = 1;
+void handle_signal(int sig)
+{
+    received_signal = 1;
 }
 
-void list_hunts() {
-    DIR *dir = opendir(".");
-    struct dirent *entry;
+int is_hidden(const char *name)
+{
+    return name[0] == '.';
+}
 
-    if (!dir) {
-        perror("opendir");
+void list_all_hunts()
+{
+    DIR *main_dir = opendir(".");
+    if (!main_dir)
+    {
+        perror("Could not open current directory");
         return;
     }
 
-    while ((entry = readdir(dir)) != NULL) {
+    struct dirent *entry;
+    while ((entry = readdir(main_dir)) != NULL)
+    {
         if (entry->d_type == DT_DIR &&
-            strcmp(entry->d_name, ".") != 0 &&
-            strcmp(entry->d_name, "..") != 0) {
+            !is_hidden(entry->d_name) &&
+            strcmp(entry->d_name, "vscode") != 0)
+        {
+
+            char sub_path[256];
+            snprintf(sub_path, sizeof(sub_path), "%s", entry->d_name);
+
+            DIR *sub_dir = opendir(sub_path);
+            if (!sub_dir)
+                continue;
 
             int count = 0;
-            char path[512];
-            snprintf(path, sizeof(path), "./%s", entry->d_name);
-
-            DIR *subdir = opendir(path);
-            struct dirent *subentry;
-
-            if (subdir) {
-                while ((subentry = readdir(subdir)) != NULL) {
-                    if (strcmp(subentry->d_name, ".") != 0 && strcmp(subentry->d_name, "..") != 0) {
-                        count++;
-                    }
-                }
-                closedir(subdir);
+            struct dirent *file;
+            while ((file = readdir(sub_dir)) != NULL)
+            {
+                if (!is_hidden(file->d_name) &&
+                    strcmp(file->d_name, "logged_hunt") != 0)
+                    count++;
             }
 
-            printf("Hunt: %s, Treasures: %d\n", entry->d_name, count);
+            closedir(sub_dir);
+            printf("Hunt: %s | Treasures: %d\n", entry->d_name, count);
+        }
+    }
+
+    closedir(main_dir);
+    fflush(stdout);
+}
+
+void list_treasures_in_hunt(const char *folder)
+{
+    DIR *dir = opendir(folder);
+    if (!dir)
+    {
+        printf("Hunt '%s' not found.\n", folder);
+        fflush(stdout);
+        return;
+    }
+
+    printf("Treasures in hunt '%s':\n", folder);
+    struct dirent *file;
+    while ((file = readdir(dir)) != NULL)
+    {
+        if (!is_hidden(file->d_name) &&
+            strcmp(file->d_name, "logged_hunt") != 0)
+        {
+            printf(" - %s\n", file->d_name);
         }
     }
 
     closedir(dir);
+    fflush(stdout);
 }
 
-void list_treasures(const char *huntID) {
-    char path[256];
-    snprintf(path, sizeof(path), "%s", huntID);
-    DIR *dir = opendir(path);
+void display_treasure(const char *folder, const char *treasure)
+{
+    char filepath[512];
+    snprintf(filepath, sizeof(filepath), "%s/%s", folder, treasure);
 
-    if (!dir) {
-        printf("Hunt '%s' does not exist.\n", huntID);
+    FILE *f = fopen(filepath, "r");
+    if (!f)
+    {
+        printf("Could not read treasure '%s' in hunt '%s'.\n", treasure, folder);
+        fflush(stdout);
         return;
     }
 
-    struct dirent *entry;
-    printf("Treasures in hunt '%s':\n", huntID);
-
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) {
-            printf("- %s\n", entry->d_name);
-        }
-    }
-
-    closedir(dir);
-}
-
-void view_treasure(const char *huntID, const char *ID) {
-    char path[256];
-    snprintf(path, sizeof(path), "%s/%s", huntID, ID);
-
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        printf("Treasure '%s' not found in hunt '%s'.\n", ID, huntID);
-        return;
-    }
-
+    printf("Contents of treasure '%s' from '%s':\n", treasure, folder);
     char line[256];
-    printf("Details of treasure '%s' in hunt '%s':\n", ID, huntID);
-    while (fgets(line, sizeof(line), f)) {
+    while (fgets(line, sizeof(line), f))
+    {
         printf("%s", line);
     }
 
     fclose(f);
+    fflush(stdout);
 }
 
-void handle_command(const char *command) {
-    char cmd[50], arg1[50], arg2[50];
-    int args = sscanf(command, "%s %s %s", cmd, arg1, arg2);
+void execute_command(const char *command)
+{
+    char cmd[64], arg1[64], arg2[64];
+    int count = sscanf(command, "%s %s %s", cmd, arg1, arg2);
 
-    if (strcmp(cmd, "list_hunts") == 0) {
-        list_hunts();
-    } else if (strcmp(cmd, "list_treasures") == 0 && args >= 2) {
-        list_treasures(arg1);
-    } else if (strcmp(cmd, "view_treasure") == 0 && args == 3) {
-        view_treasure(arg1, arg2);
-    } else if (strcmp(cmd, "stop") == 0) {
-        printf("Stopping monitor...\n");
-        usleep(500000);  // întârziere pentru testare (0.5 secunde)
+    if (strcmp(cmd, "list_hunts") == 0)
+    {
+        list_all_hunts();
+    }
+    else if (strcmp(cmd, "list_treasures") == 0 && count >= 2)
+    {
+        list_treasures_in_hunt(arg1);
+    }
+    else if (strcmp(cmd, "view_treasure") == 0 && count == 3)
+    {
+        display_treasure(arg1, arg2);
+    }
+    else if (strcmp(cmd, "stop") == 0)
+    {
+        printf("Shutting down...\n");
+        fflush(stdout);
         exit(0);
-    } else {
-        printf("Unknown or malformed command: '%s'\n", command);
+    }
+    else
+    {
+        printf("Unknown command: '%s'\n", command);
+        fflush(stdout);
     }
 }
 
-int main() {
+int main()
+{
     struct sigaction sa;
-    sa.sa_handler = sigusr1_handler;
+    sa.sa_handler = handle_signal;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
+
     sigaction(SIGUSR1, &sa, NULL);
 
-    printf("Monitor running with PID %d\n", getpid());
-
-    while (1) {
-        if (got_command) {
-            got_command = 0;
+    while (1)
+    {
+        if (received_signal)
+        {
+            received_signal = 0;
 
             FILE *f = fopen("monitor_command.cmd", "r");
-            if (!f) {
-                perror("Could not open command file");
+            if (!f)
+            {
+                perror("Cannot open command file");
                 continue;
             }
 
-            char line[256];
-            if (fgets(line, sizeof(line), f)) {
-                line[strcspn(line, "\n")] = 0;  // elimină newline
-                handle_command(line);
+            char cmd[256];
+            if (fgets(cmd, sizeof(cmd), f))
+            {
+                cmd[strcspn(cmd, "\n")] = '\0';
+                execute_command(cmd);
             }
 
             fclose(f);
         }
 
-        usleep(100000);  // evita busy-wait
+        usleep(100000);
     }
 
     return 0;
